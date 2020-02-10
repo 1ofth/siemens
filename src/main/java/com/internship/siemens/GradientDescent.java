@@ -1,7 +1,7 @@
 package com.internship.siemens;
 
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Iterator;
 import java.util.List;
 
 import org.apache.spark.api.java.JavaSparkContext;
@@ -12,7 +12,7 @@ import org.apache.spark.util.DoubleAccumulator;
 
 public class GradientDescent {
     private static final byte EX_USAGE = 64;
-    private static final double ACCURACY = 0.0001;
+    private static final double ACCURACY = 1E-10;
 
     private GradientDescent() {
     }
@@ -27,10 +27,14 @@ public class GradientDescent {
 
     static JavaRDD<double[]> divideRDD(final JavaRDD<String> input) {
         //@TODO what is preferable in our case? map or mapPartitions? JavaRDD or JavaPairRDD???
-        return input.map(e ->
-                Arrays.stream(e.split("\\p{javaSpaceChar}+"))
-                        .mapToDouble(Double::valueOf)
-                        .toArray());
+        return input.mapPartitions(itr -> {
+            List<double[]> list = new ArrayList<>();
+            itr.forEachRemaining(line ->
+                    list.add(Arrays.stream(line.split("\\p{javaSpaceChar}+"))
+                            .mapToDouble(Double::valueOf)
+                            .toArray()));
+            return list.iterator();
+        });
     }
 
     static void updateWeights(final double[] weights,
@@ -52,33 +56,35 @@ public class GradientDescent {
         }
     }
 
-    static void handlePartition(final Iterator<double[]> iterator,
-                                final DoubleAccumulator errorAccumulator,
-                                final CollectionAccumulator<double[]> thetaAccumulator,
-                                final double[] weights) {
-        double[] localGradient = new double[weights.length];
-        double[] localError = new double[1];
-        Arrays.fill(localGradient, 0);
-        localError[0] = 0;
-        iterator.forEachRemaining(item -> { // foreach sample in DS, item - array of x's and y
-            double delta = hypothesis(item, weights) - item[item.length - 1];
-            for (int i = 0; i < localGradient.length; i++) {
-                localGradient[i] += delta * item[i];
-            }
-            localError[0] += delta * delta;
+    static void stepGradientDescent(final JavaRDD<double[]> dataset,
+                                    final DoubleAccumulator errorAccumulator,
+                                    final CollectionAccumulator<double[]> thetaAccumulator,
+                                    final double[] weights) {
+        dataset.foreachPartition(iterator -> {
+            double[] localGradient = new double[weights.length];
+            double[] localError = new double[1];
+            Arrays.fill(localGradient, 0);
+            localError[0] = 0;
+            iterator.forEachRemaining(item -> { // foreach sample in DS, item - array of x's and y
+                double delta = hypothesis(item, weights) - item[item.length - 1];
+                localGradient[0] += delta;
+                for (int i = 1; i < localGradient.length; i++) {
+                    localGradient[i] += delta * item[i - 1];
+                }
+                localError[0] += delta * delta;
 
+            });
+            // send error and grad to master
+            thetaAccumulator.add(localGradient);
+            errorAccumulator.add(localError[0]);
         });
-        System.out.println("Local error: " + localError[0]);
-        // send error and grad to master
-        thetaAccumulator.add(localGradient);
-        errorAccumulator.add(localError[0]);
     }
 
-    static void gradientDescent(final double[] weights,
-                                final JavaSparkContext jsc,
-                                final JavaRDD<double[]> dataset,
-                                final double learningRate,
-                                final int maxIterations) {
+    private static void gradientDescentRunner(final double[] weights,
+                                      final JavaSparkContext jsc,
+                                      final JavaRDD<double[]> dataset,
+                                      final double learningRate,
+                                      final int maxIterations) {
         Arrays.fill(weights, 1);
         double errorPrevious = Double.POSITIVE_INFINITY;
         double errorCurrent = 0;
@@ -90,15 +96,11 @@ public class GradientDescent {
 
         while (Math.abs(errorPrevious - errorCurrent) > ACCURACY && iteration++ < maxIterations) {
 
-            dataset.foreachPartition(iterator ->
-                    handlePartition(iterator, errorAccumulator, thetaAccumulator, weights));
+            stepGradientDescent(dataset, errorAccumulator, thetaAccumulator, weights);
+            updateWeights(weights, thetaAccumulator, learningRate, dataSetSize);
 
             errorPrevious = errorCurrent;
             errorCurrent = errorAccumulator.value() / dataSetSize;
-
-            System.out.println("Current error: " + errorCurrent);
-
-            updateWeights(weights, thetaAccumulator, learningRate, dataSetSize);
 
             errorAccumulator.reset();
             thetaAccumulator.reset();
@@ -109,19 +111,19 @@ public class GradientDescent {
      * @return trained weights
      */
     public static double[] distributedGradientDescent(final String path,
-                                               final int coresNumber,
-                                               final double learningRate,
-                                               final int maxIterations) {
+                                                      final int coresNumber,
+                                                      final double learningRate,
+                                                      final int maxIterations) {
         // when running using spark-submit
         SparkConf conf = new SparkConf()
                 .setAppName("DistributedGradientDescent")
                 .setMaster(String.format("local[%1$d]", coresNumber));
         JavaSparkContext jsc = new JavaSparkContext(conf);
-        JavaRDD<String> incoming = jsc.textFile(path);
+        JavaRDD<String> incoming = jsc.textFile(path, coresNumber);
         JavaRDD<double[]> dataset = divideRDD(incoming);
         double[] weights = new double[dataset.first().length];
 
-        gradientDescent(weights, jsc, dataset, learningRate, maxIterations);
+        gradientDescentRunner(weights, jsc, dataset, learningRate, maxIterations);
 
         jsc.stop();
         return weights;
