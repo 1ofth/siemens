@@ -4,11 +4,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.SparkConf;
 import org.apache.spark.util.CollectionAccumulator;
 import org.apache.spark.util.DoubleAccumulator;
+import scala.Tuple2;
 
 public class GradientDescent {
     private static final byte EX_USAGE = 64;
@@ -17,22 +19,30 @@ public class GradientDescent {
     private GradientDescent() {
     }
 
-    static double hypothesis(final double[] xy, final double[] weights) {
-        double hypothesis = weights[0];
-        for (int i = 0; i < xy.length - 1; i++) {
-            hypothesis += weights[i + 1] * xy[i];
+    static double hypothesis(final double[] params, final double[] weights) {
+        double hypothesis = 0;
+        for (int i = 0; i < params.length; i++) {
+            hypothesis += weights[i] * params[i];
         }
         return hypothesis;
     }
 
-    static JavaRDD<double[]> divideRDD(final JavaRDD<String> input) {
-        //@TODO what is preferable in our case? map or mapPartitions? JavaRDD or JavaPairRDD???
-        return input.mapPartitions(itr -> {
-            List<double[]> list = new ArrayList<>();
-            itr.forEachRemaining(line ->
-                    list.add(Arrays.stream(line.split("\\p{javaSpaceChar}+"))
-                            .mapToDouble(Double::valueOf)
-                            .toArray()));
+    static JavaPairRDD<double[], Double> divideRDD(final JavaRDD<String> input) {
+        return input.mapPartitionsToPair(itr -> {
+            List<Tuple2<double[], Double>> list = new ArrayList<>();
+            itr.forEachRemaining(line -> {
+                String[] str = line.trim().split("\\p{javaSpaceChar}+");
+
+                String[] parameters = new String[str.length];
+                System.arraycopy(str, 0, parameters, 1, str.length - 1);
+                parameters[0] = "1";
+
+                list.add(new Tuple2<>(
+                        Arrays.stream(parameters)
+                                .mapToDouble(Double::valueOf)
+                                .toArray(), Double.valueOf(str[str.length - 1])));
+
+            });
             return list.iterator();
         });
     }
@@ -45,7 +55,6 @@ public class GradientDescent {
         double[] thetaValue = new double[weights.length];
 
         for (double[] currThetaValues : localThetaValues) {
-            assert thetaValue.length == currThetaValues.length;
             for (int i = 0; i < currThetaValues.length; i++) {
                 thetaValue[i] += currThetaValues[i];
             }
@@ -56,7 +65,7 @@ public class GradientDescent {
         }
     }
 
-    static void stepGradientDescent(final JavaRDD<double[]> dataset,
+    static void stepGradientDescent(final JavaPairRDD<double[], Double> dataset,
                                     final DoubleAccumulator errorAccumulator,
                                     final CollectionAccumulator<double[]> thetaAccumulator,
                                     final double[] weights) {
@@ -66,10 +75,9 @@ public class GradientDescent {
             Arrays.fill(localGradient, 0);
             localError[0] = 0;
             iterator.forEachRemaining(item -> { // foreach sample in DS, item - array of x's and y
-                double delta = hypothesis(item, weights) - item[item.length - 1];
-                localGradient[0] += delta;
-                for (int i = 1; i < localGradient.length; i++) {
-                    localGradient[i] += delta * item[i - 1];
+                double delta = hypothesis(item._1, weights) - item._2;
+                for (int i = 0; i < localGradient.length; i++) {
+                    localGradient[i] += delta * item._1[i];
                 }
                 localError[0] += delta * delta;
 
@@ -81,10 +89,10 @@ public class GradientDescent {
     }
 
     private static void gradientDescentRunner(final double[] weights,
-                                      final JavaSparkContext jsc,
-                                      final JavaRDD<double[]> dataset,
-                                      final double learningRate,
-                                      final int maxIterations) {
+                                              final JavaSparkContext jsc,
+                                              final JavaPairRDD<double[], Double> dataset,
+                                              final double learningRate,
+                                              final int maxIterations) {
         Arrays.fill(weights, 1);
         double errorPrevious = Double.POSITIVE_INFINITY;
         double errorCurrent = 0;
@@ -120,8 +128,8 @@ public class GradientDescent {
                 .setMaster(String.format("local[%1$d]", coresNumber));
         JavaSparkContext jsc = new JavaSparkContext(conf);
         JavaRDD<String> incoming = jsc.textFile(path, coresNumber);
-        JavaRDD<double[]> dataset = divideRDD(incoming);
-        double[] weights = new double[dataset.first().length];
+        JavaPairRDD<double[], Double> dataset = divideRDD(incoming);
+        double[] weights = new double[dataset.first()._1.length];
 
         gradientDescentRunner(weights, jsc, dataset, learningRate, maxIterations);
 
