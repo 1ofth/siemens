@@ -46,7 +46,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>com.internship.siemens.GradientDescent</mainClass>
+                            <mainClass>com.internship.siemens.Main</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
